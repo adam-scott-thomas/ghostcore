@@ -9,6 +9,7 @@ NO model calls. NO registry mutation. NO inferred defaults.
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,6 +27,10 @@ class RoutingFactor(str, Enum):
     CONTEXT_HEADROOM = "context_headroom"
     REFUSAL_RATE = "refusal_rate"
     PROVIDER_PREFERENCE = "provider_preference"
+    OBSERVED_LATENCY = "observed_latency"
+    BUDGET_PRESSURE = "budget_pressure"
+    TASK_AFFINITY = "task_affinity"
+    LOAD_BALANCE = "load_balance"
 
 
 @dataclass
@@ -120,6 +125,10 @@ class RoutingWeights:
     cost_hint: float = 5.0          # Cost is a tiebreaker
     context_headroom: float = 5.0   # More headroom is better
     refusal_rate: float = 15.0      # Avoid models that refuse often
+    observed_latency: float = 12.0  # Observed latency from learning store
+    budget_pressure: float = 8.0    # Budget-aware cost penalisation
+    task_affinity: float = 25.0     # Preference boost for matching tasks
+    load_balance_jitter: float = 0.0  # Random jitter for load balancing
 
 
 @dataclass
@@ -318,6 +327,156 @@ def _score_refusal_rate(
     )
 
 
+def _get_spine(name: str):
+    """Safely retrieve a capability from spine singleton. Returns None if unavailable."""
+    try:
+        from spine import Core
+        return Core.instance().get(name)
+    except Exception:
+        return None
+
+
+def _score_observed_latency(
+    model: ModelEntry,
+    weight: float,
+) -> Tuple[float, RoutingReason]:
+    """Score based on observed latency from LearningStore via spine."""
+    learning = _get_spine("learning")
+    if learning is None:
+        return weight * 0.5, RoutingReason(
+            factor=RoutingFactor.OBSERVED_LATENCY,
+            description="No learning store available (spine not booted)",
+            score_contribution=weight * 0.5,
+            raw_value=None,
+        )
+
+    stats = learning.stats(model.alias)
+    if stats.call_count < 5:
+        return weight * 0.5, RoutingReason(
+            factor=RoutingFactor.OBSERVED_LATENCY,
+            description=f"Insufficient data ({stats.call_count} calls, need 5)",
+            score_contribution=weight * 0.5,
+            raw_value=stats.call_count,
+        )
+
+    avg_ms = stats.avg_latency_ms
+    # Normalize: <1s = 1.0, >10s = 0.0
+    if avg_ms <= 1000:
+        raw_score = 1.0
+    elif avg_ms >= 10000:
+        raw_score = 0.0
+    else:
+        raw_score = 1.0 - (avg_ms - 1000) / 9000
+
+    contribution = raw_score * weight
+
+    return contribution, RoutingReason(
+        factor=RoutingFactor.OBSERVED_LATENCY,
+        description=f"Observed avg latency {avg_ms:.0f}ms (score: {raw_score:.2f})",
+        score_contribution=contribution,
+        raw_value=avg_ms,
+    )
+
+
+def _score_budget_pressure(
+    model: ModelEntry,
+    weight: float,
+) -> Tuple[float, RoutingReason]:
+    """Score based on budget pressure — penalise expensive models when budget is tight."""
+    budget = _get_spine("budget")
+    if budget is None:
+        return weight * 0.5, RoutingReason(
+            factor=RoutingFactor.BUDGET_PRESSURE,
+            description="No budget tracker available (spine not booted)",
+            score_contribution=weight * 0.5,
+            raw_value=None,
+        )
+
+    ratio = budget.daily_ratio()
+    if ratio <= 0.8:
+        # Budget is fine — neutral score
+        return weight * 0.5, RoutingReason(
+            factor=RoutingFactor.BUDGET_PRESSURE,
+            description=f"Budget OK ({ratio*100:.0f}% consumed)",
+            score_contribution=weight * 0.5,
+            raw_value=ratio,
+        )
+
+    # Budget pressure is high (>80%). Penalise expensive models.
+    input_cost = 0.0
+    if model.cost_hints:
+        input_cost = model.cost_hints.input_per_1k_tokens or 0.0
+
+    # More expensive models get penalised more under pressure.
+    # Normalize cost: $0 = no penalty (1.0), $0.02+ = max penalty (0.0)
+    if input_cost <= 0.001:
+        cost_score = 1.0
+    elif input_cost >= 0.02:
+        cost_score = 0.0
+    else:
+        cost_score = 1.0 - (input_cost - 0.001) / 0.019
+
+    # Scale penalty by how far over 80% we are (80%→ mild, 100%→ full)
+    pressure_factor = min((ratio - 0.8) / 0.2, 1.0)
+    # Cheaper models keep their score, expensive ones drop toward 0
+    raw_score = cost_score * (1.0 - pressure_factor)
+
+    contribution = raw_score * weight
+
+    return contribution, RoutingReason(
+        factor=RoutingFactor.BUDGET_PRESSURE,
+        description=f"Budget {ratio*100:.0f}% consumed, model cost ${input_cost:.4f}/1k (score: {raw_score:.2f})",
+        score_contribution=contribution,
+        raw_value=ratio,
+    )
+
+
+def _score_task_affinity(
+    model: ModelEntry,
+    call: ControlCoreCall,
+    weight: float,
+) -> Tuple[float, RoutingReason]:
+    """Score based on task affinity preferences. Boost IS the score (not multiplied by weight)."""
+    prefs = _get_spine("preferences")
+    if prefs is None:
+        return 0.0, RoutingReason(
+            factor=RoutingFactor.TASK_AFFINITY,
+            description="No preferences available (spine not booted)",
+            score_contribution=0.0,
+            raw_value=None,
+        )
+
+    intent = call.intent.cls.value
+    boost = prefs.get_boost(model.alias, intent=intent)
+
+    return boost, RoutingReason(
+        factor=RoutingFactor.TASK_AFFINITY,
+        description=f"Affinity boost {boost:+.1f} for intent '{intent}'",
+        score_contribution=boost,
+        raw_value=boost,
+    )
+
+
+def _score_load_balance(jitter: float) -> Tuple[float, RoutingReason]:
+    """Add random jitter for load balancing. If jitter=0, deterministic."""
+    if jitter <= 0:
+        return 0.0, RoutingReason(
+            factor=RoutingFactor.LOAD_BALANCE,
+            description="Load balance jitter disabled",
+            score_contribution=0.0,
+            raw_value=0.0,
+        )
+
+    value = random.uniform(-jitter, jitter)
+
+    return value, RoutingReason(
+        factor=RoutingFactor.LOAD_BALANCE,
+        description=f"Random jitter {value:+.2f} (range ±{jitter:.1f})",
+        score_contribution=value,
+        raw_value=value,
+    )
+
+
 def compute_routing_order(
     call: ControlCoreCall,
     eligible_models: List[ModelEntry],
@@ -376,6 +535,24 @@ def compute_routing_order(
         reasons.append(reason)
 
         score, reason = _score_refusal_rate(model, refusal_history, weights.refusal_rate)
+        total_score += score
+        reasons.append(reason)
+
+        # --- Intelligent routing factors (spine-backed) ---
+
+        score, reason = _score_observed_latency(model, weights.observed_latency)
+        total_score += score
+        reasons.append(reason)
+
+        score, reason = _score_budget_pressure(model, weights.budget_pressure)
+        total_score += score
+        reasons.append(reason)
+
+        score, reason = _score_task_affinity(model, call, weights.task_affinity)
+        total_score += score
+        reasons.append(reason)
+
+        score, reason = _score_load_balance(weights.load_balance_jitter)
         total_score += score
         reasons.append(reason)
 
