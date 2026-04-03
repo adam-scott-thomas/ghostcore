@@ -7,12 +7,13 @@ Each provider has its own class but shares common infrastructure.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from abc import abstractmethod
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Callable
+from typing import Any, Dict, List, Optional, Set, Callable, Tuple
 
 import httpx
 
@@ -91,6 +92,9 @@ class CloudAdapterConfig(AdapterConfig):
     default_max_tokens: int = 4096
     default_temperature: float = 0.7
 
+    # SSE streaming (collect chunks incrementally for partial results on timeout)
+    stream: bool = True
+
     # Connection settings
     connect_timeout: float = 10.0
     read_timeout: float = 300.0
@@ -163,6 +167,190 @@ class CloudAdapter(ExecutionAdapter):
         """Check if response indicates refusal. Returns reason or None."""
         return None
 
+    def _parse_stream_chunk(self, line: str) -> Optional[str]:
+        """
+        Parse a single SSE line and extract content text.
+
+        Subclasses override to handle provider-specific SSE formats.
+        Returns extracted text content or None if the line has no content.
+        Also updates self._stream_usage when usage info is found.
+        """
+        return None
+
+    def _supports_streaming(self) -> bool:
+        """Check if this adapter subclass supports streaming."""
+        # True if the subclass overrides _parse_stream_chunk
+        return type(self)._parse_stream_chunk is not CloudAdapter._parse_stream_chunk
+
+    async def _execute_streaming(
+        self,
+        call: ControlCoreCall,
+        model_alias: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        endpoint: str,
+        model_id: str,
+        soft_timeout_ms: Optional[int],
+        hard_timeout_ms: Optional[int],
+    ) -> AdapterResult:
+        """
+        Execute a streaming request, collecting chunks incrementally.
+
+        On soft timeout, returns partial content with soft_timeout status.
+        On hard timeout, returns partial content with timeout status.
+        On completion, returns full content with success status.
+        """
+        start_time = datetime.utcnow()
+        soft_ms, hard_ms = self.get_effective_timeouts(call, soft_timeout_ms, hard_timeout_ms)
+
+        # Add stream flag to payload
+        payload = {**payload, "stream": True}
+
+        # For Anthropic, also request usage in the stream
+        if self._cloud_config.provider == CloudProvider.ANTHROPIC:
+            payload["stream"] = True
+
+        # Reset per-stream usage tracking
+        self._stream_usage: Dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+
+        collected_chunks: List[str] = []
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    connect=self._cloud_config.connect_timeout,
+                    read=hard_ms / 1000,
+                    write=30.0,
+                    pool=10.0,
+                ),
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    endpoint,
+                    headers=headers,
+                    json=payload,
+                ) as response:
+                    # Check for HTTP errors before reading body
+                    if response.status_code == 429:
+                        end_time = datetime.utcnow()
+                        timing = AdapterTiming.create(start_time, end_time)
+                        return AdapterResult(
+                            status=AdapterStatus.rate_limited,
+                            error_message="Rate limited",
+                            error_code="RATE_LIMITED",
+                            provenance=self.create_provenance(model_alias, timing=timing),
+                        )
+
+                    if response.status_code in (401, 403):
+                        end_time = datetime.utcnow()
+                        timing = AdapterTiming.create(start_time, end_time)
+                        return AdapterResult(
+                            status=AdapterStatus.error,
+                            error_message="Authentication failed",
+                            error_code="AUTH_ERROR",
+                            provenance=self.create_provenance(model_alias, timing=timing),
+                        )
+
+                    if response.status_code >= 400:
+                        error_body = await response.aread()
+                        error_text = error_body.decode("utf-8", errors="replace")[:500]
+                        end_time = datetime.utcnow()
+                        timing = AdapterTiming.create(start_time, end_time)
+                        return AdapterResult(
+                            status=AdapterStatus.error,
+                            error_message=f"API error {response.status_code}: {error_text}",
+                            error_code=f"API_{response.status_code}",
+                            provenance=self.create_provenance(model_alias, timing=timing),
+                        )
+
+                    # Stream lines and collect content
+                    soft_deadline = start_time.timestamp() + (soft_ms / 1000)
+                    soft_timeout_hit = False
+
+                    async for line in response.aiter_lines():
+                        if not line:
+                            continue
+
+                        chunk_text = self._parse_stream_chunk(line)
+                        if chunk_text is not None:
+                            collected_chunks.append(chunk_text)
+
+                        # Check soft timeout
+                        now = datetime.utcnow().timestamp()
+                        if not soft_timeout_hit and now >= soft_deadline:
+                            soft_timeout_hit = True
+
+            # Stream completed successfully
+            end_time = datetime.utcnow()
+            timing = AdapterTiming.create(start_time, end_time)
+            content = "".join(collected_chunks)
+
+            return AdapterResult(
+                status=AdapterStatus.success,
+                content=content,
+                provenance=self.create_provenance(
+                    model_alias,
+                    timing=timing,
+                    input_tokens=self._stream_usage.get("input_tokens", 0),
+                    output_tokens=self._stream_usage.get("output_tokens", 0),
+                    provider_model_id=model_id,
+                ),
+            )
+
+        except httpx.TimeoutException:
+            end_time = datetime.utcnow()
+            timing = AdapterTiming.create(start_time, end_time)
+            partial_content = "".join(collected_chunks) if collected_chunks else None
+
+            if partial_content:
+                return AdapterResult(
+                    status=AdapterStatus.soft_timeout,
+                    content=partial_content,
+                    is_partial=True,
+                    error_message="Request timed out (partial content collected)",
+                    error_code="TIMEOUT",
+                    provenance=self.create_provenance(
+                        model_alias,
+                        timing=timing,
+                        input_tokens=self._stream_usage.get("input_tokens", 0),
+                        output_tokens=self._stream_usage.get("output_tokens", 0),
+                        provider_model_id=model_id,
+                    ),
+                )
+            else:
+                return AdapterResult(
+                    status=AdapterStatus.timeout,
+                    error_message="Request timed out",
+                    error_code="TIMEOUT",
+                    provenance=self.create_provenance(model_alias, timing=timing),
+                )
+
+        except Exception as e:
+            end_time = datetime.utcnow()
+            timing = AdapterTiming.create(start_time, end_time)
+            partial_content = "".join(collected_chunks) if collected_chunks else None
+
+            if partial_content:
+                return AdapterResult(
+                    status=AdapterStatus.soft_timeout,
+                    content=partial_content,
+                    is_partial=True,
+                    error_message=f"Stream interrupted: {str(e)}",
+                    error_code="STREAM_ERROR",
+                    provenance=self.create_provenance(
+                        model_alias,
+                        timing=timing,
+                        provider_model_id=model_id,
+                    ),
+                )
+            else:
+                return AdapterResult(
+                    status=AdapterStatus.error,
+                    error_message=f"Request failed: {str(e)}",
+                    error_code="REQUEST_ERROR",
+                    provenance=self.create_provenance(model_alias, timing=timing),
+                )
+
     async def execute(
         self,
         call: ControlCoreCall,
@@ -204,7 +392,14 @@ class CloudAdapter(ExecutionAdapter):
                 provenance=self.create_provenance(model_alias),
             )
 
-        # Execute request
+        # Dispatch to streaming path if enabled and supported
+        if self._cloud_config.stream and self._supports_streaming():
+            return await self._execute_streaming(
+                call, model_alias, headers, payload, endpoint, model_id,
+                soft_timeout_ms, hard_timeout_ms,
+            )
+
+        # Non-streaming path (unchanged)
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(
@@ -346,6 +541,42 @@ class OpenAIAdapter(CloudAdapter):
 
         return content, input_tokens, output_tokens
 
+    def _parse_stream_chunk(self, line: str) -> Optional[str]:
+        """Parse OpenAI SSE chunk.
+
+        Format:
+            data: {"choices":[{"delta":{"content":"Hello"}}]}
+            data: {"choices":[{}],"usage":{"prompt_tokens":10,"completion_tokens":5}}
+            data: [DONE]
+        """
+        if not line.startswith("data: "):
+            return None
+
+        data_str = line[6:]  # Strip "data: " prefix
+
+        if data_str.strip() == "[DONE]":
+            return None
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            return None
+
+        # Capture usage from final chunk (OpenAI sends it with stream_options)
+        usage = data.get("usage")
+        if usage:
+            self._stream_usage["input_tokens"] = usage.get("prompt_tokens", 0)
+            self._stream_usage["output_tokens"] = usage.get("completion_tokens", 0)
+
+        # Extract delta content
+        choices = data.get("choices", [])
+        if not choices:
+            return None
+
+        delta = choices[0].get("delta", {})
+        content = delta.get("content")
+        return content  # may be None if delta has no content key
+
     def _check_refusal(self, data: Dict[str, Any]) -> Optional[str]:
         choices = data.get("choices", [])
         if choices:
@@ -407,6 +638,49 @@ class AnthropicAdapter(CloudAdapter):
         output_tokens = usage.get("output_tokens", 0)
 
         return content, input_tokens, output_tokens
+
+    def _parse_stream_chunk(self, line: str) -> Optional[str]:
+        """Parse Anthropic SSE chunk.
+
+        Format:
+            event: content_block_delta
+            data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}
+            event: message_delta
+            data: {"type":"message_delta","usage":{"output_tokens":15}}
+            event: message_stop
+        """
+        if not line.startswith("data: "):
+            return None
+
+        data_str = line[6:]
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            return None
+
+        msg_type = data.get("type", "")
+
+        # Content delta — extract text
+        if msg_type == "content_block_delta":
+            delta = data.get("delta", {})
+            if delta.get("type") == "text_delta":
+                return delta.get("text")
+
+        # Message start — capture input token count
+        if msg_type == "message_start":
+            message = data.get("message", {})
+            usage = message.get("usage", {})
+            if "input_tokens" in usage:
+                self._stream_usage["input_tokens"] = usage["input_tokens"]
+
+        # Message delta — capture output token count
+        if msg_type == "message_delta":
+            usage = data.get("usage", {})
+            if "output_tokens" in usage:
+                self._stream_usage["output_tokens"] = usage["output_tokens"]
+
+        return None
 
     def _check_refusal(self, data: Dict[str, Any]) -> Optional[str]:
         if data.get("stop_reason") == "end_turn":
@@ -470,6 +744,32 @@ class XAIAdapter(CloudAdapter):
         output_tokens = usage.get("completion_tokens", 0)
 
         return content, input_tokens, output_tokens
+
+    def _parse_stream_chunk(self, line: str) -> Optional[str]:
+        """Parse xAI SSE chunk (OpenAI-compatible format)."""
+        if not line.startswith("data: "):
+            return None
+
+        data_str = line[6:]
+        if data_str.strip() == "[DONE]":
+            return None
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            return None
+
+        usage = data.get("usage")
+        if usage:
+            self._stream_usage["input_tokens"] = usage.get("prompt_tokens", 0)
+            self._stream_usage["output_tokens"] = usage.get("completion_tokens", 0)
+
+        choices = data.get("choices", [])
+        if not choices:
+            return None
+
+        delta = choices[0].get("delta", {})
+        return delta.get("content")
 
 
 # =============================================================================
@@ -593,6 +893,32 @@ class OpenAICompatibleAdapter(CloudAdapter):
         output_tokens = usage.get("completion_tokens", 0)
 
         return content, input_tokens, output_tokens
+
+    def _parse_stream_chunk(self, line: str) -> Optional[str]:
+        """Parse OpenAI-compatible SSE chunk (Groq, Together, Mistral, etc.)."""
+        if not line.startswith("data: "):
+            return None
+
+        data_str = line[6:]
+        if data_str.strip() == "[DONE]":
+            return None
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            return None
+
+        usage = data.get("usage")
+        if usage:
+            self._stream_usage["input_tokens"] = usage.get("prompt_tokens", 0)
+            self._stream_usage["output_tokens"] = usage.get("completion_tokens", 0)
+
+        choices = data.get("choices", [])
+        if not choices:
+            return None
+
+        delta = choices[0].get("delta", {})
+        return delta.get("content")
 
 
 # =============================================================================
@@ -731,6 +1057,7 @@ def create_google_adapter(
         adapter_version="1.0.0",
         provider=CloudProvider.GOOGLE,
         api_key=api_key,
+        stream=False,  # Google uses a different streaming format; non-streaming for now
         model_mapping=model_mapping or {
             "gemini": "gemini-1.5-pro",
             "gemini-pro": "gemini-1.5-pro",

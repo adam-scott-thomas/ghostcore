@@ -3,13 +3,14 @@ Tests for cloud LLM adapters.
 
 Covers: OpenAI, Anthropic, Google, xAI, and all OpenAI-compatible providers
 (Groq, Together, Mistral, DeepSeek, Perplexity).
+Includes streaming (SSE) tests for providers that support it.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 from unittest.mock import patch
 
 import httpx
@@ -17,6 +18,7 @@ import pytest
 import respx
 
 from ControlCore.adapters.cloud import (
+    CloudAdapter,
     CloudAdapterConfig,
     CloudProvider,
     OpenAIAdapter,
@@ -69,6 +71,44 @@ def _google_success_body(content: str = "Hello!") -> Dict[str, Any]:
         ],
         "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 4},
     }
+
+
+def _openai_sse_bytes(
+    chunks: List[str],
+    prompt_tokens: int = 10,
+    completion_tokens: int = 5,
+) -> bytes:
+    """Build OpenAI-format SSE byte stream from content chunks."""
+    lines = []
+    for chunk_text in chunks:
+        data = {"choices": [{"delta": {"content": chunk_text}}]}
+        lines.append(f"data: {json.dumps(data)}\n\n")
+    # Final chunk with usage
+    final = {"choices": [{}], "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}}
+    lines.append(f"data: {json.dumps(final)}\n\n")
+    lines.append("data: [DONE]\n\n")
+    return "".join(lines).encode()
+
+
+def _anthropic_sse_bytes(
+    chunks: List[str],
+    input_tokens: int = 12,
+    output_tokens: int = 8,
+) -> bytes:
+    """Build Anthropic-format SSE byte stream from content chunks."""
+    lines = []
+    # message_start with input usage
+    msg_start = {"type": "message_start", "message": {"usage": {"input_tokens": input_tokens}}}
+    lines.append(f"event: message_start\ndata: {json.dumps(msg_start)}\n\n")
+    # content blocks
+    for chunk_text in chunks:
+        data = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": chunk_text}}
+        lines.append(f"event: content_block_delta\ndata: {json.dumps(data)}\n\n")
+    # message_delta with output usage
+    msg_delta = {"type": "message_delta", "usage": {"output_tokens": output_tokens}}
+    lines.append(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n")
+    lines.append("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+    return "".join(lines).encode()
 
 
 # ---------------------------------------------------------------------------
@@ -174,10 +214,12 @@ class TestOpenAIExecute:
         self.endpoint = PROVIDER_ENDPOINTS[CloudProvider.OPENAI]
 
     async def test_success_200(self):
+        """OpenAI streams by default — mock SSE response."""
         call = make_call(target_alias="gpt4o", prompt="Hello")
+        sse = _openai_sse_bytes(["Hi", " there"], prompt_tokens=10, completion_tokens=5)
         with respx.mock(assert_all_called=True) as mock:
             mock.post(self.endpoint).mock(
-                return_value=httpx.Response(200, json=_openai_success_body("Hi there"))
+                return_value=httpx.Response(200, content=sse)
             )
             result = await self.adapter.execute(call, "gpt4o")
 
@@ -221,17 +263,28 @@ class TestOpenAIExecute:
         assert result.status == AdapterStatus.error
         assert result.error_code == "AUTH_ERROR"
 
-    async def test_content_filter_returns_refused(self):
+    async def test_content_filter_returns_refused_nonstream(self):
+        """Content filter detection requires non-streaming path (refusal is in JSON body)."""
+        config = CloudAdapterConfig(
+            adapter_name="openai",
+            adapter_version="1.0.0",
+            provider=CloudProvider.OPENAI,
+            api_key="sk-test",
+            stream=False,
+            model_mapping={"gpt4o": "gpt-4o"},
+            handled_models={"gpt4o"},
+        )
+        adapter = OpenAIAdapter(config)
         call = make_call(target_alias="gpt4o", prompt="Hello")
         body = {
             "choices": [{"message": {"content": "", "refusal": None}, "finish_reason": "content_filter"}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 0},
         }
         with respx.mock(assert_all_called=True) as mock:
-            mock.post(self.endpoint).mock(
+            mock.post(PROVIDER_ENDPOINTS[CloudProvider.OPENAI]).mock(
                 return_value=httpx.Response(200, json=body)
             )
-            result = await self.adapter.execute(call, "gpt4o")
+            result = await adapter.execute(call, "gpt4o")
 
         assert result.status == AdapterStatus.refused
 
@@ -317,10 +370,12 @@ class TestAnthropicExecute:
         self.endpoint = PROVIDER_ENDPOINTS[CloudProvider.ANTHROPIC]
 
     async def test_success_200(self):
+        """Anthropic streams by default — mock SSE response."""
         call = make_call(target_alias="claude", prompt="Hello")
+        sse = _anthropic_sse_bytes(["Got", " it"], input_tokens=12, output_tokens=8)
         with respx.mock(assert_all_called=True) as mock:
             mock.post(self.endpoint).mock(
-                return_value=httpx.Response(200, json=_anthropic_success_body("Got it"))
+                return_value=httpx.Response(200, content=sse)
             )
             result = await self.adapter.execute(call, "claude")
 
@@ -574,10 +629,12 @@ class TestOpenAICompatibleExecute:
         self.endpoint = PROVIDER_ENDPOINTS[CloudProvider.GROQ]
 
     async def test_success_200(self):
+        """Groq (OpenAI-compatible) streams by default — mock SSE response."""
         call = make_call(target_alias="llama-70b", prompt="Hello")
+        sse = _openai_sse_bytes(["Fast", " answer"], prompt_tokens=10, completion_tokens=5)
         with respx.mock(assert_all_called=True) as mock:
             mock.post(self.endpoint).mock(
-                return_value=httpx.Response(200, json=_openai_success_body("Fast answer"))
+                return_value=httpx.Response(200, content=sse)
             )
             result = await self.adapter.execute(call, "llama-70b")
 
@@ -593,6 +650,361 @@ class TestOpenAICompatibleExecute:
             result = await self.adapter.execute(call, "llama-70b")
 
         assert result.status == AdapterStatus.rate_limited
+
+
+# ---------------------------------------------------------------------------
+# SSE Streaming Tests
+# ---------------------------------------------------------------------------
+
+class TestOpenAIStreaming:
+    """Verify OpenAI SSE streaming collects content and usage correctly."""
+
+    def setup_method(self):
+        self.adapter = create_openai_adapter(api_key="sk-test")
+        self.endpoint = PROVIDER_ENDPOINTS[CloudProvider.OPENAI]
+
+    async def test_multi_chunk_content(self):
+        call = make_call(target_alias="gpt4o", prompt="Tell me a story")
+        sse = _openai_sse_bytes(
+            ["Once", " upon", " a", " time"],
+            prompt_tokens=15,
+            completion_tokens=20,
+        )
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post(self.endpoint).mock(
+                return_value=httpx.Response(200, content=sse)
+            )
+            result = await self.adapter.execute(call, "gpt4o")
+
+        assert result.status == AdapterStatus.success
+        assert result.content == "Once upon a time"
+        assert result.provenance.input_tokens == 15
+        assert result.provenance.output_tokens == 20
+
+    async def test_single_chunk(self):
+        call = make_call(target_alias="gpt4o", prompt="Hi")
+        sse = _openai_sse_bytes(["Hello!"], prompt_tokens=5, completion_tokens=1)
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post(self.endpoint).mock(
+                return_value=httpx.Response(200, content=sse)
+            )
+            result = await self.adapter.execute(call, "gpt4o")
+
+        assert result.status == AdapterStatus.success
+        assert result.content == "Hello!"
+
+    async def test_stream_rate_limit_429(self):
+        call = make_call(target_alias="gpt4o", prompt="Hello")
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post(self.endpoint).mock(
+                return_value=httpx.Response(429, text="rate limited")
+            )
+            result = await self.adapter.execute(call, "gpt4o")
+
+        assert result.status == AdapterStatus.rate_limited
+
+    async def test_stream_auth_error_401(self):
+        call = make_call(target_alias="gpt4o", prompt="Hello")
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post(self.endpoint).mock(
+                return_value=httpx.Response(401, text="Unauthorized")
+            )
+            result = await self.adapter.execute(call, "gpt4o")
+
+        assert result.status == AdapterStatus.error
+        assert result.error_code == "AUTH_ERROR"
+
+    async def test_stream_server_error_500(self):
+        call = make_call(target_alias="gpt4o", prompt="Hello")
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post(self.endpoint).mock(
+                return_value=httpx.Response(500, text="Internal Server Error")
+            )
+            result = await self.adapter.execute(call, "gpt4o")
+
+        assert result.status == AdapterStatus.error
+        assert result.error_code == "API_500"
+
+
+class TestAnthropicStreaming:
+    """Verify Anthropic SSE streaming collects content and usage correctly."""
+
+    def setup_method(self):
+        self.adapter = create_anthropic_adapter(api_key="sk-ant-test")
+        self.endpoint = PROVIDER_ENDPOINTS[CloudProvider.ANTHROPIC]
+
+    async def test_multi_chunk_content(self):
+        call = make_call(target_alias="claude", prompt="Tell me about AI")
+        sse = _anthropic_sse_bytes(
+            ["Artificial", " intelligence", " is", " fascinating"],
+            input_tokens=20,
+            output_tokens=30,
+        )
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post(self.endpoint).mock(
+                return_value=httpx.Response(200, content=sse)
+            )
+            result = await self.adapter.execute(call, "claude")
+
+        assert result.status == AdapterStatus.success
+        assert result.content == "Artificial intelligence is fascinating"
+        assert result.provenance.input_tokens == 20
+        assert result.provenance.output_tokens == 30
+
+    async def test_single_chunk(self):
+        call = make_call(target_alias="claude", prompt="Hi")
+        sse = _anthropic_sse_bytes(["Hello!"], input_tokens=5, output_tokens=1)
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post(self.endpoint).mock(
+                return_value=httpx.Response(200, content=sse)
+            )
+            result = await self.adapter.execute(call, "claude")
+
+        assert result.status == AdapterStatus.success
+        assert result.content == "Hello!"
+
+
+class TestStreamingTimeout:
+    """Verify that streaming returns partial content on timeout."""
+
+    async def test_timeout_with_partial_content(self):
+        """Simulate timeout mid-stream: adapter should return partial content."""
+        adapter = create_openai_adapter(api_key="sk-test")
+        endpoint = PROVIDER_ENDPOINTS[CloudProvider.OPENAI]
+        call = make_call(target_alias="gpt4o", prompt="Hello")
+
+        from contextlib import asynccontextmanager
+        import unittest.mock as um
+
+        class MockResponse:
+            status_code = 200
+            async def aiter_lines(self):
+                yield 'data: {"choices":[{"delta":{"content":"Partial"}}]}'
+                yield ''
+                yield 'data: {"choices":[{"delta":{"content":" content"}}]}'
+                yield ''
+                raise httpx.ReadTimeout("read timed out")
+            async def aclose(self):
+                pass
+
+        @asynccontextmanager
+        async def mock_stream(*args, **kwargs):
+            yield MockResponse()
+
+        with um.patch.object(httpx.AsyncClient, "stream", mock_stream):
+            result = await adapter.execute(call, "gpt4o")
+
+        # ReadTimeout during iteration should propagate up and be caught
+        # by the except httpx.TimeoutException handler, returning partial content
+        assert result.status == AdapterStatus.soft_timeout
+        assert result.content == "Partial content"
+        assert result.is_partial is True
+
+    async def test_timeout_with_no_content(self):
+        """Timeout before any content arrives should return hard timeout."""
+        adapter = create_openai_adapter(api_key="sk-test")
+        call = make_call(target_alias="gpt4o", prompt="Hello")
+
+        from contextlib import asynccontextmanager
+        import unittest.mock as um
+
+        class MockResponse:
+            status_code = 200
+            async def aiter_lines(self):
+                raise httpx.ReadTimeout("read timed out")
+                yield  # make this an async generator
+            async def aclose(self):
+                pass
+
+        @asynccontextmanager
+        async def mock_stream(*args, **kwargs):
+            yield MockResponse()
+
+        with um.patch.object(httpx.AsyncClient, "stream", mock_stream):
+            result = await adapter.execute(call, "gpt4o")
+
+        assert result.status == AdapterStatus.timeout
+        assert result.content is None
+
+
+class TestNonStreamingPathPreserved:
+    """Verify that the non-streaming code path works correctly when stream=False."""
+
+    async def test_openai_nonstream_success(self):
+        config = CloudAdapterConfig(
+            adapter_name="openai",
+            adapter_version="1.0.0",
+            provider=CloudProvider.OPENAI,
+            api_key="sk-test",
+            stream=False,
+            model_mapping={"gpt4o": "gpt-4o"},
+            handled_models={"gpt4o"},
+        )
+        adapter = OpenAIAdapter(config)
+        endpoint = PROVIDER_ENDPOINTS[CloudProvider.OPENAI]
+        call = make_call(target_alias="gpt4o", prompt="Hello")
+
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post(endpoint).mock(
+                return_value=httpx.Response(200, json=_openai_success_body("Non-stream reply"))
+            )
+            result = await adapter.execute(call, "gpt4o")
+
+        assert result.status == AdapterStatus.success
+        assert result.content == "Non-stream reply"
+        assert result.structured is not None  # Non-streaming path returns structured data
+        assert result.provenance.input_tokens == 10
+        assert result.provenance.output_tokens == 5
+
+    async def test_anthropic_nonstream_success(self):
+        config = CloudAdapterConfig(
+            adapter_name="anthropic",
+            adapter_version="1.0.0",
+            provider=CloudProvider.ANTHROPIC,
+            api_key="sk-ant-test",
+            stream=False,
+            model_mapping={"claude": "claude-sonnet-4-20250514"},
+            handled_models={"claude"},
+        )
+        adapter = AnthropicAdapter(config)
+        endpoint = PROVIDER_ENDPOINTS[CloudProvider.ANTHROPIC]
+        call = make_call(target_alias="claude", prompt="Hello")
+
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post(endpoint).mock(
+                return_value=httpx.Response(200, json=_anthropic_success_body("Non-stream Claude"))
+            )
+            result = await adapter.execute(call, "claude")
+
+        assert result.status == AdapterStatus.success
+        assert result.content == "Non-stream Claude"
+        assert result.structured is not None
+
+    async def test_google_always_nonstream(self):
+        """Google adapter should always use non-streaming path."""
+        adapter = create_google_adapter(api_key="google-test-key")
+        endpoint = adapter._get_endpoint("gemini-1.5-pro")
+        call = make_call(target_alias="gemini", prompt="Hello")
+
+        with respx.mock(assert_all_called=True) as mock:
+            mock.post(endpoint).mock(
+                return_value=httpx.Response(200, json=_google_success_body("Google reply"))
+            )
+            result = await adapter.execute(call, "gemini")
+
+        assert result.status == AdapterStatus.success
+        assert result.content == "Google reply"
+        assert result.structured is not None
+
+
+class TestStreamingSupport:
+    """Verify _supports_streaming() correctly identifies streaming-capable adapters."""
+
+    def test_openai_supports_streaming(self):
+        adapter = create_openai_adapter(api_key="sk-test")
+        assert adapter._supports_streaming() is True
+
+    def test_anthropic_supports_streaming(self):
+        adapter = create_anthropic_adapter(api_key="sk-ant-test")
+        assert adapter._supports_streaming() is True
+
+    def test_xai_supports_streaming(self):
+        adapter = create_xai_adapter(api_key="xai-test")
+        assert adapter._supports_streaming() is True
+
+    def test_groq_supports_streaming(self):
+        adapter = create_groq_adapter(api_key="groq-test")
+        assert adapter._supports_streaming() is True
+
+    def test_google_does_not_support_streaming(self):
+        adapter = create_google_adapter(api_key="google-test")
+        # Google has stream=False in config and no _parse_stream_chunk override
+        assert adapter._supports_streaming() is False
+
+    def test_cohere_does_not_support_streaming(self):
+        """CohereAdapter has no _parse_stream_chunk override."""
+        from ControlCore.adapters.cloud import CohereAdapter
+        config = CloudAdapterConfig(
+            adapter_name="cohere",
+            adapter_version="1.0.0",
+            provider=CloudProvider.COHERE,
+            api_key="co-test",
+            stream=False,
+        )
+        adapter = CohereAdapter(config)
+        assert adapter._supports_streaming() is False
+
+
+class TestParseStreamChunk:
+    """Unit tests for _parse_stream_chunk on each provider."""
+
+    def test_openai_extracts_content(self):
+        adapter = create_openai_adapter(api_key="sk-test")
+        adapter._stream_usage = {"input_tokens": 0, "output_tokens": 0}
+        result = adapter._parse_stream_chunk('data: {"choices":[{"delta":{"content":"Hello"}}]}')
+        assert result == "Hello"
+
+    def test_openai_skips_done(self):
+        adapter = create_openai_adapter(api_key="sk-test")
+        adapter._stream_usage = {"input_tokens": 0, "output_tokens": 0}
+        result = adapter._parse_stream_chunk("data: [DONE]")
+        assert result is None
+
+    def test_openai_skips_non_data_lines(self):
+        adapter = create_openai_adapter(api_key="sk-test")
+        adapter._stream_usage = {"input_tokens": 0, "output_tokens": 0}
+        assert adapter._parse_stream_chunk("event: message") is None
+        assert adapter._parse_stream_chunk("") is None
+        assert adapter._parse_stream_chunk(": comment") is None
+
+    def test_openai_captures_usage(self):
+        adapter = create_openai_adapter(api_key="sk-test")
+        adapter._stream_usage = {"input_tokens": 0, "output_tokens": 0}
+        adapter._parse_stream_chunk(
+            'data: {"choices":[{}],"usage":{"prompt_tokens":42,"completion_tokens":17}}'
+        )
+        assert adapter._stream_usage["input_tokens"] == 42
+        assert adapter._stream_usage["output_tokens"] == 17
+
+    def test_anthropic_extracts_text_delta(self):
+        adapter = create_anthropic_adapter(api_key="sk-ant-test")
+        adapter._stream_usage = {"input_tokens": 0, "output_tokens": 0}
+        line = 'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"world"}}'
+        result = adapter._parse_stream_chunk(line)
+        assert result == "world"
+
+    def test_anthropic_captures_output_tokens(self):
+        adapter = create_anthropic_adapter(api_key="sk-ant-test")
+        adapter._stream_usage = {"input_tokens": 0, "output_tokens": 0}
+        adapter._parse_stream_chunk(
+            'data: {"type":"message_delta","usage":{"output_tokens":25}}'
+        )
+        assert adapter._stream_usage["output_tokens"] == 25
+
+    def test_anthropic_captures_input_tokens(self):
+        adapter = create_anthropic_adapter(api_key="sk-ant-test")
+        adapter._stream_usage = {"input_tokens": 0, "output_tokens": 0}
+        adapter._parse_stream_chunk(
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":33}}}'
+        )
+        assert adapter._stream_usage["input_tokens"] == 33
+
+    def test_anthropic_skips_event_lines(self):
+        adapter = create_anthropic_adapter(api_key="sk-ant-test")
+        adapter._stream_usage = {"input_tokens": 0, "output_tokens": 0}
+        assert adapter._parse_stream_chunk("event: content_block_delta") is None
+
+    def test_openai_compatible_extracts_content(self):
+        adapter = create_groq_adapter(api_key="groq-test")
+        adapter._stream_usage = {"input_tokens": 0, "output_tokens": 0}
+        result = adapter._parse_stream_chunk('data: {"choices":[{"delta":{"content":"fast"}}]}')
+        assert result == "fast"
+
+    def test_xai_extracts_content(self):
+        adapter = create_xai_adapter(api_key="xai-test")
+        adapter._stream_usage = {"input_tokens": 0, "output_tokens": 0}
+        result = adapter._parse_stream_chunk('data: {"choices":[{"delta":{"content":"grok"}}]}')
+        assert result == "grok"
 
 
 # ---------------------------------------------------------------------------
