@@ -67,6 +67,67 @@ from ControlCore.circuit_breaker import (
 logger = TracedLogger(__name__)
 
 
+def _writeback(
+    model_alias: str,
+    adapter_result: "AdapterResult",
+    intent: str,
+) -> None:
+    """
+    Fire-and-forget writeback to learning store and budget tracker.
+
+    Reads spine if booted; returns silently if spine is not available.
+    NEVER raises — writeback failures must not affect execution.
+    """
+    try:
+        from spine import Core, CoreNotBooted
+        try:
+            core = Core.instance()
+        except CoreNotBooted:
+            return
+
+        # --- cost estimate ---------------------------------------------------
+        cost = 0.0
+        prov = adapter_result.provenance
+        if prov is not None:
+            input_tok = prov.input_tokens or 0
+            output_tok = prov.output_tokens or 0
+            cost = (input_tok * 0.01 + output_tok * 0.03) / 1000
+
+        # --- latency ---------------------------------------------------------
+        latency_ms: float = 0.0
+        if prov is not None and prov.timing is not None:
+            latency_ms = float(prov.timing.total_ms)
+
+        # --- outcome string --------------------------------------------------
+        outcome = adapter_result.status.value  # e.g. "success", "error", …
+
+        # --- learning store --------------------------------------------------
+        if core.has("learning"):
+            try:
+                store = core.get("learning")
+                store.record(
+                    model_alias=model_alias,
+                    latency_ms=latency_ms,
+                    cost=cost,
+                    outcome=outcome,
+                    intent=intent,
+                )
+            except Exception:
+                pass
+
+        # --- budget tracker --------------------------------------------------
+        if core.has("budget"):
+            try:
+                tracker = core.get("budget")
+                tracker.record_spend(cost)
+            except Exception:
+                pass
+
+    except Exception:
+        # Absolute safety net — writeback must never crash the caller.
+        pass
+
+
 class ExecutionOutcome(str, Enum):
     """Outcome of execution attempt."""
     SUCCESS = "success"
@@ -384,6 +445,9 @@ class ExecutionEngine:
                 soft_timeout_ms=call.options.timeouts.soft_ms if call.options.timeouts else None,
                 hard_timeout_ms=call.options.timeouts.hard_ms if call.options.timeouts else None,
             )
+
+            # Writeback to learning store and budget tracker (never crashes)
+            _writeback(model_alias, result, call.intent.cls.value)
 
             # Record attempt
             attempt = ExecutionAttempt(

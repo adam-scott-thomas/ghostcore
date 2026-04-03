@@ -17,6 +17,10 @@ def boot(config_path: Optional[Path] = None) -> Core:
     from ControlCore.circuit_breaker import CircuitBreakerRegistry
 
     def setup(c: Core) -> None:
+        from ControlCore.registry.learning import LearningStore
+        from ControlCore.registry.budget import BudgetTracker, BudgetConfig
+        from ControlCore.registry.preferences import Preferences
+
         config = ControlCoreConfig()
         if config_path is not None:
             config.registry_path = str(config_path)
@@ -29,6 +33,9 @@ def boot(config_path: Optional[Path] = None) -> Core:
         c.register("model_registry", model_registry)
         c.register("adapter_registry", adapter_registry)
         c.register("circuit_registry", CircuitBreakerRegistry())
+        c.register("learning", LearningStore())
+        c.register("budget", BudgetTracker(BudgetConfig(daily_limit=10.0, hourly_limit=2.0)))
+        c.register("preferences", Preferences())
         c.boot(env="prod")
 
     return Core.boot_once(setup)
