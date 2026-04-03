@@ -3,16 +3,16 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ghostcore"
+name = "ghostrouter"
 version = "0.1.0"
-description = "LLM orchestration gateway — intelligent routing, fallback, circuit breakers, redaction, 10+ providers"
+description = "The LLM router that learns — intelligent routing, fallback, circuit breakers, budget tracking, 10+ providers"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [
     {name = "Adam Thomas", email = "adam@ghostlogic.dev"}
 ]
-keywords = ["llm", "gateway", "orchestration", "routing", "anthropic", "openai", "ai"]
+keywords = ["llm", "router", "orchestration", "routing", "anthropic", "openai", "ai", "learning", "budget"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -32,9 +32,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/adam-scott-thomas/ghostcore"
-Repository = "https://github.com/adam-scott-thomas/ghostcore"
-Issues = "https://github.com/adam-scott-thomas/ghostcore/issues"
+Homepage = "https://github.com/adam-scott-thomas/ghostrouter"
+Repository = "https://github.com/adam-scott-thomas/ghostrouter"
+Issues = "https://github.com/adam-scott-thomas/ghostrouter/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -45,8 +45,7 @@ dev = [
 ]
 
 [project.scripts]
-ControlCore = "ControlCore.cli:main"
-ghostcore = "ControlCore.cli:main"
+ghostrouter = "ControlCore.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

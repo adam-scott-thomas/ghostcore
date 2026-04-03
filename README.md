@@ -1,15 +1,15 @@
-# ghostcore
+# ghostrouter
 
-LLM orchestration gateway with intelligent routing, fallback, and redaction.
+The LLM router that learns. Intelligent routing across 10+ providers, with fallback, circuit breakers, budget tracking, and post-model redaction.
 
 ## Why
 
-Every project hardcodes model names and API clients. When a model is slow, rate-limited, or refuses a request, the call just fails. ghostcore routes each call to the best available model automatically — with circuit breakers, fallback chains, and post-model redaction baked in.
+Every project hardcodes model names and API clients. When a model is slow, rate-limited, or refuses a request, the call just fails. ghostrouter routes each call to the best available model automatically — with circuit breakers, fallback chains, and post-model redaction baked in.
 
 ## Install
 
 ```bash
-pip install ghostcore
+pip install ghostrouter
 ```
 
 ## Quick Start
@@ -39,9 +39,9 @@ print(result.answer)
 Or boot as a daemon and call over HTTP:
 
 ```bash
-ghostcore serve            # binds to localhost:8265
-ghostcore run claude "Explain recursion"
-ghostcore result <job_id> --poll
+ghostrouter serve            # binds to localhost:8265
+ghostrouter run claude "Explain recursion"
+ghostrouter result <job_id> --poll
 ```
 
 ## Architecture
@@ -88,7 +88,7 @@ Set the relevant `*_API_KEY` environment variables to enable each provider.
 
 ## Spine Integration (optional)
 
-ghostcore supports [maelspine](https://github.com/adam-scott-thomas/maelspine) for zero-import access to registries across a larger application:
+ghostrouter supports [maelspine](https://github.com/adam-scott-thomas/maelspine) for zero-import access to registries across a larger application:
 
 ```python
 from ControlCore.boot import boot
@@ -113,7 +113,7 @@ registry = Core.instance().get("model_registry")
 
 ```
 maelspine   — frozen capability registry
-ghostcore   — LLM orchestration gateway  ← you are here
+ghostrouter   — LLM orchestration gateway  ← you are here
 ghostserver — evidence server (Blackbox)
 ```
 
