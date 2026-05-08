@@ -1,3 +1,5 @@
+> **⚠ DEPRECATED — this is a frozen public snapshot of the project that became [`ghostrouter`](https://pypi.org/project/ghostrouter/).** Originally named `ghostcore`, the project was renamed and active development continues in a private repo. Use `pip install ghostrouter`. See [DEPRECATED.md](./DEPRECATED.md).
+
 # ghostrouter
 
 The LLM router that learns. Intelligent routing across 10+ providers, with fallback, circuit breakers, budget tracking, and post-model redaction.
